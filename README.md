@@ -381,3 +381,134 @@ def flood_weighted_loss_momento(alpha=10.0, beta=18.0, gamma=1000.0, L=L_scaled,
    - **Cell 5:** Descriptive statistical and distribution analysis of 8-hour stage oscillations ($\Delta y_{8	ext{h}}$).
    - **Cell 6:** Training of the **AGL Loss BiLSTM** model.
    - **Cell 7:** Comparative metric computation and interactive Plotly hydrograph rendering.
+  
+   # Leave-One-Event-Out (LOEO) Flood Generalization: Itajaí-Açu River Basin (`AGL_Itajai_LOEO_3.ipynb`)
+
+Technical documentation and execution guide for `AGL_Itajai_LOEO_3.ipynb`, evaluating out-of-distribution physical extrapolation, extreme stage forecasting, and peak underestimation mitigation during the historic flood crest ($939.50\text{ cm}$) in the **Itajaí-Açu River Basin (Blumenau - SC, Brazil)**.
+
+---
+
+## 📌 1. Overview
+
+Flash-flood-prone watersheds with steep terrain morphology (such as the Itajaí-Açu River) present severe challenges to data-driven deep learning models. When trained on standard Mean Squared Error (MSE), models suffer from **Predictive Inertia** and the **Peak Smoothing Paradox**, heavily damping critical flood heights.
+
+This notebook implements a strict **Leave-One-Event-Out (LOEO)** experimental protocol:
+* **Historic Crest Isolation:** The extreme flood event around index $46784$ (reaching an all-time peak of $939.50\text{ cm}$) is entirely excluded from the training and validation partitions.
+* **Zero-Shot Kinematic Extrapolation:** The network is optimized strictly on baseflows and minor-to-moderate flood pulses, and then evaluated on its capacity to forecast the unseen catastrophic hydrograph.
+* **Controlled Ablation:** Dual-input BiLSTM optimized with **MSE Loss** vs. identical architecture optimized with **Asymmetric Gradient Loss (AGL)** over an 8-hour lead horizon ($T+8\text{h}$).
+
+---
+
+## 🛠️ 2. Dependencies & Environment
+
+* **Python:** `>= 3.10`
+* **Core Libraries:**
+  ```text
+  tensorflow>=2.15.0
+  numpy>=1.24.0
+  pandas>=2.0.0
+  scikit-learn>=1.3.0
+  plotly>=5.18.0
+  matplotlib>=3.8.0
+  ```
+
+---
+
+## 📥 3. Data Inputs & LOEO Partitioning Scheme
+
+### 3.1 Source Tensor
+* **File:** `lstm_blumenau_2017_2022_nivel_vazao2.npz`
+  * `X_passado`: Shape `(N, 10, 10)` — Historical sliding window ($T-10$ to $T$, including local discharge, cumulative rainfall, soil moisture, and atmospheric forcings).
+  * `X_futuro`: Shape `(N, 10, 9)` — Exogenous forecast window ($T+8$ to $T+18$, excluding river stage).
+  * `y`: Shape `(N, 1)` — Observed river level in centimeters at $T+8\text{h}$.
+
+### 3.2 Isolation Logic
+```python
+# 1. Detect Peak Index
+indice_pico = np.argmax(y)  # Index 46784 (939.50 cm)
+
+# 2. Slice Test Window (2,700 hourly steps ≈ 112.5 days around the event)
+margem_antes, margem_depois = 1500, 1200
+inicio_test = max(0, indice_pico - margem_antes)  # Index 45284
+fim_test = min(len(y), indice_pico + margem_depois) # Index 47984
+
+# 3. Test vs. Train/Val Sets
+X1_test, X2_test, y_test = X_passado[inicio_test:fim_test], X_futuro[inicio_test:fim_test], y[inicio_test:fim_test]
+indices_resto = np.setdiff1d(np.arange(len(y)), np.arange(inicio_test, fim_test))
+
+# 80/20 Chronological Split on the remaining dataset
+n_treino = int(len(indices_resto) * 0.8)
+X1_train, X2_train, y_train = X_passado[indices_resto][:n_treino], X_futuro[indices_resto][:n_treino], y[indices_resto][:n_treino]
+X1_val, X2_val, y_val = X_passado[indices_resto][n_treino:], X_futuro[indices_resto][n_treino:], y[indices_resto][n_treino:]
+```
+
+---
+
+## 🧠 4. Neural Architecture
+
+Both models share the identical multi-input topology:
+* **Historical Branch:** `Input(shape=(10, 10))` $\rightarrow$ `LSTM(64 units)` $\rightarrow$ `Dropout(0.2)`
+* **Future Meteorological Branch:** `Input(shape=(10, 9))` $\rightarrow$ `LSTM(32 units)` $\rightarrow$ `Dropout(0.2)`
+* **Head:** `Concatenate()` $\rightarrow$ `Dense(64, activation='relu')` $\rightarrow$ `Dense(32, activation='relu')` $\rightarrow$ `Dense(1, activation='linear')` (Unconstrained linear output allowing unbounded positive extrapolation).
+* **Optimizer:** `Adam(learning_rate=0.001)`, `batch_size=32`, `epochs=100`.
+
+---
+
+## 🎯 5. AGL Loss Calibration (Itajaí-Açu Basin)
+
+Calibrated for steep valley kinetic response and high flood alert levels:
+* **Flood Alert Threshold ($L$):** $400.0\text{ cm}$
+* **Velocity Noise Threshold ($\theta$):** $2.0\text{ cm}$
+* **Rising Limb Weight ($W$):** $86.0$
+* **Alert Magnitude Multiplier ($\alpha$):** $10.0$
+* **Dynamic Wave Momentum ($\beta$):** $18.0$
+* **Underestimation Risk Factor ($\gamma$):** $1000.0$
+
+```python
+def flood_weighted_loss_momento(alpha=10.0, beta=18.0, gamma=1000.0, L=L_scaled, theta=theta_scaled, W=86.0):
+    def loss(y_true, y_pred):
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
+        dy = tf.concat([[0.0], y_true[1:] - y_true[:-1]], axis=0)
+        
+        wi = 1.0 + W * tf.cast(dy > theta, tf.float32)
+        aceleracao_term = beta * tf.nn.relu(dy) * tf.square(y_true - y_pred)
+        base_term = 1.0 + alpha * tf.nn.relu(y_true - L)
+        mse_term = tf.square(y_true - y_pred)
+        under_term = gamma * tf.cast(y_true > L, tf.float32) * tf.square(tf.nn.relu(y_true - y_pred))
+
+        numerador = tf.reduce_sum(wi * (base_term * mse_term + under_term + aceleracao_term))
+        denominador = tf.reduce_sum(wi) + 1e-7
+        return numerador / denominador
+    return loss
+```
+
+---
+
+## 📈 6. Experimental Validation (Historic Crest: $939.50\text{ cm}$)
+
+### 6.1 Performance Comparison on Isolated Unseen Peak ($T+8\text{h}$)
+| Model Objective | MAE ($	ext{cm}$) | $R^2$ Score | Observed Crest | Predicted Crest | Absolute Peak Error |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Baseline (MSE Loss)** | $31.80$ | $0.85$ | $939.50\text{ cm}$ | $816.90\text{ cm}$ | **$-122.60\text{ cm}$ (Underestimated)** |
+| **AGL Loss (Ours)** | **$29.60$** | **$0.89$** | $939.50\text{ cm}$ | **$916.80\text{ cm}$** | **$-22.70\text{ cm}$** |
+
+```
+    Peak Elevation Comparison (Itajaí-Açu Historic Crest: 939.5 cm)
+    --------------------------------------------------------------
+    Observed Crest    : [========================================] 939.5 cm
+    AGL Loss (Ours)   : [======================================  ] 916.8 cm (-22.7 cm)
+    Baseline (MSE)    : [=================================       ] 816.9 cm (-122.6 cm)
+```
+
+> **Key Takeaway:** The standard MSE Baseline failed to extrapolate the unprecedented magnitude, underestimating the crest by over $1.22\text{ m}$. In contrast, **AGL Loss** correctly captured the flood momentum, reaching $916.80\text{ cm}$ (error reduced to only $22.70\text{ cm}$) while eliminating predictive lag by $12\text{ hours}$ along the rising limb.
+
+---
+
+## 🚀 7. Execution Guide
+
+1. Ensure `lstm_blumenau_2017_2022_nivel_vazao2.npz` is located in the root notebook folder.
+2. Execute the notebook sequentially:
+   - **Cell 1 (`Code`):** Execute LOEO event isolation, MinMax normalization, and train the **AGL Loss BiLSTM** model for 100 epochs.
+   - **Cell 2 (`Code`):** Train the **MSE Baseline BiLSTM** model on the exact same data partitions.
+   - **Cell 3 (`Code`):** Generate interactive Plotly hydrographs, annotate the 12h phase lag interval, compute peak metrics, and export high-resolution vector figures (`peak_criticalevents_itajai.pdf`).
