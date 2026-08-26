@@ -1,104 +1,106 @@
-Asymmetric Gradient Loss (AGL) for Flood Forecasting
-Official repository for the framework and experimental validation of Asymmetric Gradient Loss (AGL): Integrating Hydrological Momentum into Deep Learning for Flood Prediction.
-Overview
-Hydrological time-series forecasting during flash floods and extreme flood events suffers from two structural pathologies when trained with standard objective functions (e.g., Mean Squared Error - MSE):
-Predictive Inertia (Phase Lag): Models fail to capture rapid wave acceleration, lagging hours behind actual flood peaks.
-Peak Smoothing Paradox: Extreme events represent a statistical minority (<13% of historical records). Symmetric loss functions optimize for the dominant baseflow regime, severely underestimating maximum flood amplitudes.
-Asymmetric Gradient Loss (AGL) directly reshapes the optimization error surface during backpropagation by coupling:
-Hydrograph Kinematics (Momentum): Rate-of-change sensitivity to force rapid activation during the rising limb.
-Operational Risk Asymmetry: Severe penalties for peak underestimations when water levels exceed civil defense alert thresholds.
-Parametric Efficiency: Enabling lightweight single-layer networks (e.g., Vanilla-LSTM) to match or outperform multi-layered state-of-the-art hybrid architectures (e.g., Hydro-Informer).
-Mathematical Formulation
-The AGL objective function is defined as a weighted asymmetric formulation:
-L_AGL = (1 / (sum(w_i) + epsilon)) * sum(w_i * [P_base + P_asym + P_grad])
+# Training & Evaluation Pipeline: Sinos River Basin (`AGL_Rio_Sinos-train_test_val.ipynb`)
 
+Technical documentation and execution guide for the Jupyter Notebook implementing data preprocessing, temporal structuring, model training, and comparative evaluation (MSE vs. AGL Loss) for the **Sinos River Basin (RS, Brazil)**.
 
-Key Mathematical Components:
-Temporal Importance Weight: Amplifies the gradient step when river rising velocity exceeds the noise threshold.
-Magnitude Penalty: Scales the quadratic error proportionally once water level surpasses alert stage L.
-Underestimation Asymmetry: Massive penalization factor enforcing conservative, life-saving overestimation bias above hazard thresholds.
-Dynamic Momentum Term: Directly attacks phase lag by penalizing deviations during rapid stage acceleration.
-Experimental Framework & Methodology
-Phase
-Model Architecture
-Target Watershed
-Forecast Horizon
- 
-Phase 1: Loss Isolation
-Multi-Input BiLSTM (AGL vs. MSE)
-Rio dos Sinos (RS) & Rio Itajaí-Açu (SC)
-8 Hours (T+8h)
-Phase 2: Parametric Efficiency
-Vanilla-LSTM + AGL vs. Hydro-Informer (SOTA)
-Toplá River Basin
-12 Hours (T+12h)
+---
 
-Key Results Summary
-Basin
-Model
-MAE (cm)
-RMSE (cm)
-R²
-Peak Capture
-Effective Lead Time
-Historic Peak Error
- 
-Sinos River (Peak: 811.0 cm)
-Baseline (MSE)
-9.91
-14.28
-0.96
-76.19%
-2.00 h
-140.4 cm (Underestimated)
-Sinos River (Peak: 811.0 cm)
-AGL (Ours)
-17.38
-20.82
-0.92
-100.00%
-6.05 h
-19.1 cm
-Itajaí-Açu River (Peak: 939.5 cm)
-Baseline (MSE)
-17.10
-29.60
-0.92
-94.87%
-8.35 h
-77.3 cm (Underestimated)
-Itajaí-Açu River (Peak: 939.5 cm)
-AGL (Ours)
-28.72
-36.74
-0.88
-100.00%
-11.33 h
-16.0 cm
+## 📌 1. Overview
 
-Python Implementation: AGL Custom Loss
-import tensorflow as tf
+This notebook implements the complete end-to-end river stage forecasting pipeline for the Sinos River targeting an **8-hour lead time horizon ($T+8\text{h}$)**. The workflow comprises:
+1. **Sequence Engineering:** Tensor generation using historical sliding windows ($T-10$ to $T$) and projected future climate/discharge forcings ($T+8$ to $T+18$).
+2. **Baseline Training (MSE):** Optimization of a Multi-Input BiLSTM architecture governed by standard symmetric Mean Squared Error.
+3. **AGL Training (Innovation):** Training the identical dual-input architecture using the **Asymmetric Gradient Loss (AGL)**, integrating hydrograph wave kinetics and flood risk asymmetry.
+4. **Hydrological & Lead-Time Evaluation:** Comparative assessment across global regression metrics ($R^2$, MAE, RMSE) and disaster-readiness operational indicators (peak capture rate, mean effective lead time, and extra anticipatory events).
 
-def flood_weighted_loss_momento(alpha=1.0, beta=10.0, gamma=1000.0, L=350.0, theta=2.0, W=10.0):
-    def loss(y_true, y_pred):
-        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
-        y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
-        
-        # 1. Wavefront velocity / temporal derivative
-        dy = tf.concat([[0.0], y_true[1:] - y_true[:-1]], axis=0)
-        
-        # 2. Dynamic weights for rising limbs
-        wi = 1.0 + W * tf.cast(dy > theta, tf.float32)
-        
-        # 3. Penalties
-        mse_term = tf.square(y_true - y_pred)
-        aceleracao_term = beta * tf.nn.relu(dy) * mse_term
-        base_term = 1.0 + alpha * tf.nn.relu(y_true - L)
-        under_term = gamma * tf.cast(y_true > L, tf.float32) * tf.square(tf.nn.relu(y_true - y_pred))
+---
 
-        numerador = tf.reduce_sum(wi * (base_term * mse_term + under_term + aceleracao_term))
-        denominador = tf.reduce_sum(wi) + 1e-7
-        return numerador / denominador
+## 🛠️ 2. Dependencies & Environment
 
-    return loss
+* **Python Version:** `>= 3.10`
+* **Core Libraries:**
+  * `tensorflow >= 2.15.0`
+  * `numpy >= 1.24.0`
+  * `pandas >= 2.0.0`
+  * `scikit-learn >= 1.3.0`
+  * `plotly >= 5.18.0`
+  * `matplotlib >= 3.8.0`
+  * `joblib`
 
+---
+
+## 📥 3. Data Inputs
+
+### 3.1 Base Dataset
+* **File:** `dataset_engineered_enxuto.csv`
+* **Description:** Hourly multivariate time-series combining in-situ telemetric river gauges with Open-Meteo atmospheric and land-surface reanalysis data.
+
+### 3.2 Feature Set (14 Input Channels)
+| Category | Variable Name | Description |
+| :--- | :--- | :--- |
+| **Target / Stage** | `nivel_cm_series` | River water level in centimeters at São Leopoldo gauge station |
+| **Discharge** | `river_discharge_series_river_discharge (m³/s)_0`, `..._24` | Upstream and local river discharge dynamics ($m^3/s$) |
+| **Atmospheric** | `rain_real`, `cloud_real`, `dew_real`, `humidity_real`, `temperature_real`, `weather_real`, `et0_real` | Hourly precipitation, cloud cover, dew point, relative humidity, air temperature, weather code, and reference evapotranspiration |
+| **Soil Moisture** | `soil1_real`, `soil2_real`, `soil3_real`, `soil4_real` | Multi-layer volumetric soil moisture (0–7 cm, 7–28 cm, 28–100 cm, 100–255 cm) |
+
+---
+
+## ⚙️ 4. Temporal Structuring & Data Splitting
+
+```python
+janela = 10      # Historical input sequence length (10 time steps / hours)
+horizonte = 8    # Target forecast horizon (8 hours ahead)
+```
+
+* **`X_passado` (Historical Branch):** Shape `(N, 10, 14)` — All 14 historical parameters.
+* **`X_futuro` (Exogenous Forecast Branch):** Shape `(N, 10, 13)` — 13 future atmospheric and discharge features (river stage excluded).
+* **`y` (Target):** River stage at $T+8\text{h}$.
+* **Exported Preprocessed Array:** `lstm_duas_sequencias_h8.npz`
+
+### Chronological Partitioning (Strict Sequential, No Shuffle):
+* **Training Set:** $73\%$
+* **Validation Set:** $18\%$
+* **Test Set:** $9\%$
+
+---
+
+## 🧠 5. Neural Architecture (Multi-Input BiLSTM)
+
+Both models (Baseline and AGL) share the exact same structural topology for fair ablation:
+1. **Historical Context Branch:** `Input(shape=(10, 14))` $\rightarrow$ `BiLSTM(64 units)` $\rightarrow$ `Dropout(0.2)`
+2. **Future Meteorological Branch:** `Input(shape=(10, 13))` $\rightarrow$ `LSTM(32 units)` $\rightarrow$ `Dropout(0.2)`
+3. **Feature Fusion & Dense Head:** `Concatenate()` $\rightarrow$ `Dense(64, activation='relu')` $\rightarrow$ `Dense(32, activation='relu')` $\rightarrow$ `Dense(1)` (Linear Output)
+
+---
+
+## 🎯 6. AGL Hyperparameter Setup (Sinos Basin)
+
+Parameters calibrated to account for the lowland floodplain response and high urban imperviousness of the Sinos River:
+* **Flood Alert Threshold ($L$):** $350.0\,\text{cm}$ (Official municipal contingency trigger)
+* **Noise Tolerance Threshold ($\theta$):** $2.0\,\text{cm}$
+* **Rising Acceleration Weight ($W$):** $100.0$
+* **Magnitude Multiplier ($\alpha$):** $1.0$
+* **Dynamic Momentum Factor ($\beta$):** $100.0$
+* **Underestimation Asymmetry Multiplier ($\gamma$):** $10000.0$
+
+---
+
+## 📈 7. Empirical Test Set Results
+
+### 7.1 Regression & Operational Lead-Time Metrics ($T+8\text{h}$)
+| Model | MAE (cm) | RMSE (cm) | $R^2$ | Mean Lead Time | Capture Rate (%) | Extra Events | Total Peaks |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Baseline (MSE)** | $10.65$ | $14.87$ | $0.96$ | $1.33\,\text{h}$ | $100.00\%$ | $4$ | $21$ |
+| **AGL (Custom)** | $41.62$ | $44.39$ | $0.63$ | **$11.43\,\text{h}$** | **$100.00\%$** | **$20$** | $21$ |
+
+> **Operational Significance:** AGL trades symmetric baseflow precision for active flood anticipation, increasing the mean operational lead time from $1.33\,\text{h}$ to **$11.43\,\text{h}$** and boosting early warning issuances beyond the nominal 8-hour window from $4$ to **$20$**, securing indispensable evacuation margins for Civil Defense.
+
+---
+
+## 🚀 8. Execution Instructions
+
+1. Ensure `dataset_engineered_enxuto.csv` is present in the working directory (or update the file path in Cell 2).
+2. Execute the notebook cells sequentially:
+   - **Cell 2:** Feature extraction, sliding window tensor generation, and export to `lstm_duas_sequencias_h8.npz`.
+   - **Cell 4:** Training and evaluation of the **MSE Baseline** model.
+   - **Cell 6:** Training and evaluation of the **AGL Loss** model.
+   - **Cell 8:** Execution of interactive Plotly visualizer and computation of operational lead-time and peak-capture metrics.
