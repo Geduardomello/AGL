@@ -512,3 +512,123 @@ def flood_weighted_loss_momento(alpha=10.0, beta=18.0, gamma=1000.0, L=L_scaled,
    - **Cell 1 (`Code`):** Execute LOEO event isolation, MinMax normalization, and train the **AGL Loss BiLSTM** model for 100 epochs.
    - **Cell 2 (`Code`):** Train the **MSE Baseline BiLSTM** model on the exact same data partitions.
    - **Cell 3 (`Code`):** Generate interactive Plotly hydrographs, annotate the 12h phase lag interval, compute peak metrics, and export high-resolution vector figures (`peak_criticalevents_itajai.pdf`).
+  
+     # Benchmark: Hydro-Informer Baseline vs. Vanilla LSTM + AGL Loss (`Almikael et al., 2024`)
+
+Technical documentation and reproduction guide for benchmarking **Vanilla LSTM + Asymmetric Gradient Loss (AGL)** against the **Hydro-Informer (Almikael et al., 2024)** baseline on extreme flood stage forecasting over multi-step prediction horizons ($T+12\text{h}$).
+
+---
+
+## 📌 1. Overview
+
+This experiment evaluates whether replacing symmetric objective functions (MSE) with the **Asymmetric Gradient Loss (AGL)** can bridge the performance gap between lightweight recurrent networks (Vanilla LSTM) and complex Transformer-based architectures (Hydro-Informer) during critical, high-magnitude peak flows.
+
+Key methodology highlights:
+* **Benchmarked Task:** Forecasting river stage (`H_bar_Orig`) over a 12-hour future multi-step window ($T+1$ to $T+12$).
+* **Out-of-Distribution / Extreme Event Split:** Extreme event testing partition isolated at slice $[4000:6000]$ of `test_data.csv`, reserving historical records and outer tails for training.
+* **Architecture:** Compact Vanilla LSTM network ($64$ hidden units) mapping a short historical sequence ($	ext{input\_length} = 5$) directly to the multi-step horizon ($	ext{output\_length} = 12$).
+* **Loss Function:** Asymmetric Gradient Loss (AGL) with dynamic wave momentum penalty and asymmetrical underestimation risk weighting calibrated for flash stages ($L = 150\text{ cm}$).
+
+---
+
+## 🛠️ 2. Dependencies & Environment
+
+* **Python:** `>= 3.10`
+* **Core Libraries:**
+  ```text
+  tensorflow>=2.15.0
+  numpy>=1.24.0
+  pandas>=2.0.0
+  scikit-learn>=1.3.0
+  plotly>=5.18.0
+  matplotlib>=3.8.0
+  ```
+* **Local Dependency:** `utils.py` (providing `create_input_output` and `calculate_performance_metrics`).
+
+---
+
+## 📥 3. Data Ingestion & Partitioning
+
+### 3.1 Data Channels
+* **Source Files:** `train_data.csv`, `test_data.csv`
+* **Hydrological & Meteorological Features ($5$ channels):** `Q_bar_Orig`, `H_bar_Orig`, `P_ger_Orig`, `P_Cigelka`, `P_Regetovka`
+* **Temporal Auxiliary Variables ($2$ channels):** `day_of_year`, `hour_of_day`
+* **Future Exogenous Forcing ($1$ channel):** `P_bar`
+* **Target Output:** `H_bar_Orig` (Water level in $\text{cm}$)
+
+### 3.2 Partitioning Scheme
+* **Test Set:** Sliced index interval $[4000 : 6001]$ containing major flood crests.
+* **Train Set:** Concatenation of `train_data.csv` with the remaining portions of `test_data.csv` ($[0:4000]$ and $[6001:]$).
+* **Standardization:** Fit `StandardScaler` exclusively on the assembled training set and transform testing inputs/targets.
+
+---
+
+## 🧠 4. Model Topology & Multi-Step Output
+
+A lightweight sequential recurrent network:
+```python
+model = Sequential([
+    Input(shape=(5, 7)),  # 5 time steps x 7 input features
+    LSTM(64),
+    Dense(12)             # Direct multi-step trajectory output (T+1 to T+12)
+])
+```
+* **Optimizer:** `Adam(learning_rate=0.001)`
+* **Batch Size:** $16$
+* **Epochs:** $100$
+
+---
+
+## 🎯 5. AGL Loss Hyperparameter Formulation
+
+```python
+# Scaled Parameters
+L_scaled = scaler_y.transform([[150.0]])[0][0]  # Critical flood stage threshold (150 cm)
+theta_scaled = 0.15                             # Normalized velocity noise threshold
+
+def flood_weighted_loss_momento(alpha=15.0, beta=1.0, gamma=10000.0, L=L_scaled, theta=theta_scaled, W=3.0):
+    def loss(y_true, y_pred):
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
+        
+        dy = tf.concat([[0.0], y_true[1:] - y_true[:-1]], axis=0)
+        wi = 1.0 + W * tf.cast(dy > theta, tf.float32)
+        
+        mse_term = tf.square(y_true - y_pred)
+        aceleracao_term = beta * tf.nn.relu(dy) * mse_term
+        base_term = 1.0 + alpha * tf.nn.relu(y_true - L)
+        under_term = gamma * tf.cast(y_true > L, tf.float32) * tf.square(tf.nn.relu(y_true - y_pred))
+
+        return tf.reduce_sum(wi * (base_term * mse_term + under_term + aceleracao_term)) / (tf.reduce_sum(wi) + 1e-7)
+    return loss
+```
+
+---
+
+## 📈 6. Quantitative Results ($T+12\text{h}$ Lead Horizon)
+
+Performance computed on the critical extreme event test sequence at the maximum forecast horizon ($T+12\text{h}$):
+
+| Metric | Value |
+| :--- | :---: |
+| **Mean Absolute Error (MAE)** | $30.94\text{ cm}$ |
+| **Root Mean Squared Error (RMSE)** | $35.28\text{ cm}$ |
+| **Mean Squared Error (MSE)** | $1244.48\text{ cm}^2$ |
+| **Mean Absolute Percentage Error (MAPE)** | $20.16\%$ |
+| **Symmetric MAPE (SMAPE)** | $17.87\%$ |
+| **Mean Squared Logarithmic Error (MSLE)** | $0.0410$ |
+| **Root Mean Squared Logarithmic Error (RMSLE)** | $0.2026$ |
+| **Coefficient of Determination ($R^2$)** | $-1.21$ |
+
+### 6.1 Critical Peak Segment Tracking (Interval $[867:935]$)
+* When focusing on the rapid-rise stage surge segment ($[867:935]$), the AGL-penalized Vanilla LSTM reproduces the shape, timing, and amplitude of the flood wave, overcoming the severe dampening typical of standard MSE baselines.
+
+---
+
+## 🚀 7. Execution Guide
+
+1. Place `train_data.csv`, `test_data.csv`, and `utils.py` in the working directory.
+2. Run notebook cells in sequence:
+   - **Cell 1:** Assemble out-of-distribution training/testing splits, fit `StandardScaler`, instantiate the `flood_weighted_loss_momento()` loss function, train the Vanilla LSTM for 100 epochs, and compute performance metrics for $T+12\text{h}$.
+   - **Cell 2:** Generate the continuous interactive Plotly hydrograph over the entire 2,000-sample test window.
+   - **Cell 3:** Zoom in on the primary critical peak segment ($[867:935]$), format the plot matching Almikael et al. (2024) styling, and export high-resolution vector figures (`almikaeel_vs_AGL.pdf`).
