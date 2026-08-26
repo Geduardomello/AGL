@@ -104,3 +104,133 @@ Parameters calibrated to account for the lowland floodplain response and high ur
    - **Cell 4:** Training and evaluation of the **MSE Baseline** model.
    - **Cell 6:** Training and evaluation of the **AGL Loss** model.
    - **Cell 8:** Execution of interactive Plotly visualizer and computation of operational lead-time and peak-capture metrics.
+  
+
+   # Leave-One-Event-Out (LOEO) Flood Generalization: Sinos River 2024 Catastrophic Event
+
+Technical documentation and execution guide for `AGL_Rio_Sinos_LOEO_2.ipynb`, evaluating out-of-distribution generalization, peak level extrapolation, and the **Peak Smoothing Paradox** during the **May 2024 Catastrophic Flood Event** ($811.00\text{ cm}$) in the Sinos River Basin.
+
+---
+
+## 📌 1. Overview
+
+Hydrological machine learning models routinely succumb to the **Peak Smoothing Paradox**: because extreme flood peaks constitute an extreme statistical minority in training records (<13%), symmetric objective functions like Mean Squared Error (MSE) optimize predominantly for baseflow conditions, drastically underestimating maximum flood amplitudes.
+
+This notebook implements a strict **Leave-One-Event-Out (LOEO)** experimental protocol:
+* **Catastrophic Event Isolation:** The unprecedented May 2024 flood surge (reaching an all-time crest of $811.00\text{ cm}$ at index 50376) is completely removed from the training and validation sets.
+* **Out-of-Distribution Stress Test:** Models are trained solely on moderate events and normal river regimes, then challenged to extrapolate zero-shot dynamics during the catastrophic wave.
+* **Controlled Ablation:** Identical dual-input BiLSTM architectures trained with **MSE Loss** versus **Asymmetric Gradient Loss (AGL)**.
+
+---
+
+## 🛠️ 2. Dependencies & Environment
+
+* **Python:** `>= 3.10`
+* **Core Libraries:**
+  ```text
+  tensorflow>=2.15.0
+  numpy>=1.24.0
+  pandas>=2.0.0
+  scikit-learn>=1.3.0
+  plotly>=5.18.0
+  matplotlib>=3.8.0
+  ```
+
+---
+
+## 📥 3. Data Inputs & LOEO Isolation Scheme
+
+### 3.1 Input Tensor
+* **Source File:** `lstm_duas_sequencias_h8.npz`
+  * `X_passado`: Shape `(60267, 10, 14)` — Sliding historical window ($T-10$ to $T$, 14 channels including river stage, upstream/local discharge, precipitation, soil moisture, and atmospheric variables).
+  * `X_futuro`: Shape `(60267, 10, 13)` — Exogenous forecast window ($T+8$ to $T+18$, 13 weather and runoff channels; river stage excluded).
+  * `y`: Shape `(60267, 1)` — Ground truth river water level ($	ext{cm}$) at $T+8\text{h}$.
+
+### 3.2 Splitting Logic
+```python
+# 1. Absolute Peak Detection
+indice_pico = np.argmax(y)  # Index 50376 (811.00 cm)
+
+# 2. Window Isolation (2,700 hourly steps ≈ 112.5 days around the event)
+margem_antes, margem_depois = 1500, 1200
+inicio_test = indice_pico - margem_antes  # Index 48876
+fim_test = indice_pico + margem_depois    # Index 51576
+
+# 3. Test vs. Train/Val Partitions
+X1_test, X2_test, y_test = X_passado[inicio_test:fim_test], X_futuro[inicio_test:fim_test], y[inicio_test:fim_test]
+indices_resto = np.setdiff1d(np.arange(len(y)), np.arange(inicio_test, fim_test))
+
+# 80/20 Chronological Split on Remaining Records
+n_treino = int(len(indices_resto) * 0.8)
+X1_train, X2_train, y_train = X_passado[indices_resto][:n_treino], X_futuro[indices_resto][:n_treino], y[indices_resto][:n_treino]
+X1_val, X2_val, y_val = X_passado[indices_resto][n_treino:], X_futuro[indices_resto][n_treino:], y[indices_resto][n_treino:]
+```
+
+---
+
+## 🧠 4. Model Topology
+
+Both benchmark models share the exact same structural network:
+* **Historical Stream:** `Input(shape=(10, 14))` $\rightarrow$ `LSTM(64 units)` $\rightarrow$ `Dropout(0.2)`
+* **Future Exogenous Stream:** `Input(shape=(10, 13))` $\rightarrow$ `LSTM(32 units)` $\rightarrow$ `Dropout(0.2)`
+* **Head:** `Concatenate()` $\rightarrow$ `Dense(64, activation='relu')` $\rightarrow$ `Dense(32, activation='relu')` $\rightarrow$ `Dense(1, activation='linear')` (Unconstrained linear output enabling positive extrapolation above the historical normalized maximum).
+* **Optimization:** `Adam(learning_rate=0.001)`, `batch_size=32`, `epochs=100`.
+
+---
+
+## 🎯 5. AGL Loss Configuration
+
+Calibrated for the low-gradient floodplain dynamics of São Leopoldo:
+* **Alert Threshold ($L$):** $350.0\text{ cm}$
+* **Velocity Noise Tolerance ($\theta$):** $2.0\text{ cm}$
+* **Rising Acceleration Weight ($W$):** $100.0$
+* **Magnitude Multiplier ($\alpha$):** $1.0$
+* **Dynamic Wave Momentum ($\beta$):** $100.0$
+* **Underestimation Risk Factor ($\gamma$):** $10000.0$
+
+```python
+def flood_weighted_loss_momento(alpha=1.0, beta=100.0, gamma=10000.0, L=L_scaled, theta=theta_scaled, W=100.0):
+    def loss(y_true, y_pred):
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
+        dy = tf.concat([[0.0], y_true[1:] - y_true[:-1]], axis=0)
+        
+        wi = 1.0 + W * tf.cast(dy > theta, tf.float32)
+        aceleracao_term = beta * tf.nn.relu(dy) * tf.square(y_true - y_pred)
+        base_term = 1.0 + alpha * tf.nn.relu(y_true - L)
+        mse_term = tf.square(y_true - y_pred)
+        under_term = gamma * tf.cast(y_true > L, tf.float32) * tf.square(tf.nn.relu(y_true - y_pred))
+
+        numerador = tf.reduce_sum(wi * (base_term * mse_term + under_term + aceleracao_term))
+        denominador = tf.reduce_sum(wi) + 1e-7
+        return numerador / denominador
+    return loss
+```
+
+---
+
+## 📈 6. Experimental Validation (May 2024 Event: $811.00\text{ cm}$)
+
+### 6.1 Performance Comparison on Isolated Unseen Peak ($T+8\text{h}$)
+| Model Objective | MAE ($	ext{cm}$) | $R^2$ Score | Observed Crest | Predicted Crest | Absolute Peak Error |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Baseline (MSE Loss)** | $26.80$ | $0.94$ | $811.00\text{ cm}$ | $670.60\text{ cm}$ | **$-140.40\text{ cm}$ (Severe Underestimation)** |
+| **AGL Loss (Ours)** | **$11.38$** | **$0.99$** | $811.00\text{ cm}$ | **$791.90\text{ cm}$** | **$-19.10\text{ cm}$** |
+
+```
+    Peak Elevation Comparison (May 2024 Crest: 811 cm)
+    --------------------------------------------------
+    Observed Crest    : [========================================] 811.0 cm
+    AGL Loss (Ours)   : [======================================  ] 791.9 cm (-19.1 cm)
+    Baseline (MSE)    : [=================================       ] 670.6 cm (-140.4 cm)
+```
+
+---
+
+## 🚀 7. Execution Guide
+
+1. Place `lstm_duas_sequencias_h8.npz` in your notebook root directory.
+2. Run cells sequentially:
+   - **Cell 1 (`Code`):** Execute LOEO event isolation, MinMax normalization, and train the **AGL Loss BiLSTM** model.
+   - **Cell 2 (`Code`):** Train the **MSE Baseline BiLSTM** model on identical data slices.
+   - **Cell 3 (`Code`):** Generate interactive Plotly hydrographs comparing ground truth against both predicted trajectories.
