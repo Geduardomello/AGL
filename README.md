@@ -234,3 +234,150 @@ def flood_weighted_loss_momento(alpha=1.0, beta=100.0, gamma=10000.0, L=L_scaled
    - **Cell 1 (`Code`):** Execute LOEO event isolation, MinMax normalization, and train the **AGL Loss BiLSTM** model.
    - **Cell 2 (`Code`):** Train the **MSE Baseline BiLSTM** model on identical data slices.
    - **Cell 3 (`Code`):** Generate interactive Plotly hydrographs comparing ground truth against both predicted trajectories.
+  
+     # Training & Evaluation Pipeline: Itajaí-Açu River Basin (`AGL_Rio_Itajai_train_test_val.ipynb`)
+
+Technical documentation and execution guide for the Jupyter Notebook implementing multivariate data ingestion, temporal derivative statistical analysis, neural model training, and comparative evaluation (MSE vs. AGL Loss) for the **Itajaí-Açu River Basin (Blumenau - SC, Brazil)**.
+
+---
+
+## 📌 1. Overview
+
+The Itajaí-Açu River Basin is characterized by steep valley morphology and rapid hydrological response times, making downstream urban centers (e.g., Blumenau) prone to destructive flash flood waves.
+
+This notebook implements an end-to-end forecasting pipeline for river stage prediction at an **8-hour lead horizon ($T+8\text{h}$)**:
+1. **Multivariate Data Processing:** Synchronization and curation of in-situ telemetric streamflow/stage data with reanalysis climate variables from 2017 to 2022.
+2. **Derivative & Oscillation Analysis:** Statistical characterization of river stage acceleration ($\Delta y_{8	ext{h}}$) across 95th and 99th percentiles to calibrate momentum thresholds ($	heta$).
+3. **Dual-Input Baseline Model (MSE):** Training a dual-branch BiLSTM network using symmetric Mean Squared Error.
+4. **AGL Loss Optimization:** Training the identical dual-input architecture using **Asymmetric Gradient Loss (AGL)** calibrated for steep-slope flash flood dynamics.
+5. **Operational Verification:** Benchmarking flood peak capture rates ($100\%$ capture), mean warning anticipation, and early civil defense triggers.
+
+---
+
+## 🛠️ 2. Dependencies & Environment
+
+* **Python Version:** `>= 3.10`
+* **Core Libraries:**
+  ```text
+  tensorflow>=2.15.0
+  numpy>=1.24.0
+  pandas>=2.0.0
+  scikit-learn>=1.3.0
+  seaborn>=0.13.0
+  matplotlib>=3.8.0
+  plotly>=5.18.0
+  ```
+
+---
+
+## 📥 3. Input Data & Feature Set
+
+### 3.1 Base Dataset
+* **Source File:** `dataset_blumenau_sincronizado2.csv`
+* **Temporal Coverage:** Hourly records filtered from `2017-01-01` onwards.
+
+### 3.2 Feature Channels (10 Variables)
+| Category | Variable Name | Description |
+| :--- | :--- | :--- |
+| **Target / River Stage** | `nivel` | River stage in centimeters at the Blumenau telemetric station |
+| **Streamflow / Discharge** | `river_discharge_loc_0` | Local river discharge dynamics ($m^3/s$) |
+| **Precipitation** | `soma_chuva` | Cumulative basin rainfall ($mm$) |
+| **Soil & Surface** | `media_soil_moisture`, `media_et0_fao_evapotranspiration` | Mean volumetric soil moisture and FAO reference evapotranspiration |
+| **Atmospheric Forcings** | `media_dew_point`, `media_cloud_cover`, `media_relative_humidity`, `media_temperature`, `media_weather_code` | Reanalysis atmospheric forcing variables |
+
+---
+
+## ⚙️ 4. Temporal Structuring & Data Partitioning
+
+```python
+janela = 10      # Historical input sequence length (10 hourly steps)
+horizonte = 8    # Forecast horizon (8 hours ahead)
+```
+
+* **`X_passado` (Historical Context):** Shape `(N, 10, 10)` — All 10 past variables ($T-10$ to $T$).
+* **`X_futuro` (Exogenous Forecast):** Shape `(N, 10, 9)` — 9 meteorological and discharge features ($T+8$ to $T+18$, excluding river stage).
+* **`y` (Target):** River stage at $T+8	ext{h}$.
+* **Exported Preprocessed Array:** `lstm_blumenau_2017_2022_nivel_vazao2.npz`
+
+### Chronological Split (Strict Sequential):
+* **Training Set:** $73\%$
+* **Validation Set:** $18\%$
+* **Test Set:** $9\%$ (4,284 evaluation time steps)
+
+---
+
+## 📊 5. Empirical Stage Derivative Analysis ($\Delta y_{8	ext{h}}$)
+
+Statistical analysis of stage variation over 8-hour rolling windows ($y_t - y_{t-8}$) was conducted to establish empirical noise bounds:
+* **Mean 8-hour Variation:** $0.02\,\text{cm}$
+* **Standard Deviation ($\sigma$):** $35.53\,\text{cm}$
+* **95th Percentile:** $61.50\,\text{cm/8h}$
+* **99th Percentile:** $94.00\,\text{cm/8h}$
+* **Maximum Recorded Surge:** $+287.50\,\text{cm/8h}$
+
+---
+
+## 🧠 6. Model Architecture
+
+Both models utilize identical dual-branch topologies:
+* **Historical Branch:** `Input(shape=(10, 10))` $\rightarrow$ `LSTM(64 units)` $\rightarrow$ `Dropout(0.2)`
+* **Future Forecast Branch:** `Input(shape=(10, 9))` $\rightarrow$ `LSTM(32 units)` $\rightarrow$ `Dropout(0.2)`
+* **Head:** `Concatenate()` $\rightarrow$ `Dense(64, relu)` $\rightarrow$ `Dense(32, relu)` $\rightarrow$ `Dense(1)` (Linear)
+* **Optimization:** `Adam(learning_rate=0.001)`
+
+---
+
+## 🎯 7. AGL Hyperparameter Calibration (Itajaí-Açu)
+
+Calibrated for the steep topography and rapid flood kinetics of Blumenau:
+* **Flood Alert Stage ($L$):** $400.0\,\text{cm}$
+* **Velocity Noise Threshold ($\theta$):** $2.0\,\text{cm}$
+* **Rising Acceleration Weight ($W$):** $86.0$
+* **Magnitude Multiplier ($\alpha$):** $10.0$
+* **Dynamic Wave Momentum ($\beta$):** $18.0$
+* **Underestimation Risk Factor ($\gamma$):** $1000.0$
+
+```python
+def flood_weighted_loss_momento(alpha=10.0, beta=18.0, gamma=1000.0, L=L_scaled, theta=theta_scaled, W=86.0):
+    def loss(y_true, y_pred):
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
+        y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
+        dy = tf.concat([[0.0], y_true[1:] - y_true[:-1]], axis=0)
+        
+        wi = 1.0 + W * tf.cast(dy > theta, tf.float32)
+        aceleracao_term = beta * tf.nn.relu(dy) * tf.square(y_true - y_pred)
+        base_term = 1.0 + alpha * tf.nn.relu(y_true - L)
+        mse_term = tf.square(y_true - y_pred)
+        under_term = gamma * tf.cast(y_true > L, tf.float32) * tf.square(tf.nn.relu(y_true - y_pred))
+
+        numerador = tf.reduce_sum(wi * (base_term * mse_term + under_term + aceleracao_term))
+        denominador = tf.reduce_sum(wi) + 1e-7
+        return numerador / denominador
+    return loss
+```
+
+---
+
+## 📈 8. Empirical Test Set Results (4,284 Evaluation Steps)
+
+### 8.1 Comparative Benchmark ($T+8\text{h}$)
+| Model Objective | MAE ($	ext{cm}$) | RMSE ($	ext{cm}$) | $R^2$ Score | Mean Lead Time | Peak Capture Rate (%) | Extra Warning Events | Total Peaks |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Baseline (MSE Loss)** | $16.21$ | $28.55$ | $0.93$ | $8.71\,\text{h}$ | $97.44\%$ | $18$ | $39$ |
+| **AGL Loss (Ours)** | **$23.67$** | **$34.94$** | **$0.90$** | **$10.38\,\text{h}$** | **$100.00\%$** | **$36$** | $39$ |
+
+> **Operational Interpretation:** AGL eliminated all missed peaks, achieving a **$100.00\%$ peak capture rate** (39/39 peaks captured vs. 38/39 in Baseline). Furthermore, AGL doubled the issuance of early contingency warnings beyond the nominal 8-hour horizon from **18 to 36 extra events**, extending the average effective warning time to **$10.38\,\text{hours}$**.
+
+---
+
+## 🚀 9. Execution Instructions
+
+1. Ensure `dataset_blumenau_sincronizado2.csv` is present in the working directory.
+2. Execute the notebook cells sequentially:
+   - **Cell 1:** Data filtering ($2017+$), forward/backward fill NaN handling, sequence construction, and tensor export (`lstm_blumenau_2017_2022_nivel_vazao2.npz`).
+   - **Cell 2:** Array validation and NaN integrity check.
+   - **Cell 3:** Time series plot of river level in Blumenau.
+   - **Cell 4:** Training of the **MSE Baseline BiLSTM** model with Early Stopping.
+   - **Cell 5:** Descriptive statistical and distribution analysis of 8-hour stage oscillations ($\Delta y_{8	ext{h}}$).
+   - **Cell 6:** Training of the **AGL Loss BiLSTM** model.
+   - **Cell 7:** Comparative metric computation and interactive Plotly hydrograph rendering.
